@@ -1,4 +1,5 @@
 import os
+import time
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
@@ -6,6 +7,7 @@ import asyncio
 from google import genai
 from concurrent.futures import TimeoutError
 from functools import partial
+from llm_logger import get_logger, log_tool_call, set_iteration, end_session, get_summary
 
 # Load environment variables from .env file
 load_dotenv()
@@ -22,6 +24,7 @@ iteration_response = []
 async def generate_with_timeout(client, prompt, timeout=10):
     """Generate content with a timeout"""
     print("Starting LLM generation...")
+    start_time = time.time()
     try:
         # Convert the synchronous generate_content call to run in a thread
         loop = asyncio.get_event_loop()
@@ -35,13 +38,42 @@ async def generate_with_timeout(client, prompt, timeout=10):
             ),
             timeout=timeout
         )
+        execution_time = time.time() - start_time
         print("LLM generation completed")
+        
+        # Log the LLM generation
+        log_tool_call(
+            tool_name="llm_generation",
+            arguments={"model": "gemini-2.0-flash", "prompt_length": len(prompt)},
+            result={"response_length": len(response.text) if hasattr(response, 'text') else 0},
+            execution_time=execution_time,
+            success=True
+        )
+        
         return response
     except TimeoutError:
+        execution_time = time.time() - start_time
         print("LLM generation timed out!")
+        log_tool_call(
+            tool_name="llm_generation",
+            arguments={"model": "gemini-2.0-flash", "prompt_length": len(prompt)},
+            result=None,
+            execution_time=execution_time,
+            success=False,
+            error_message="Timeout"
+        )
         raise
     except Exception as e:
+        execution_time = time.time() - start_time
         print(f"Error in LLM generation: {e}")
+        log_tool_call(
+            tool_name="llm_generation",
+            arguments={"model": "gemini-2.0-flash", "prompt_length": len(prompt)},
+            result=None,
+            execution_time=execution_time,
+            success=False,
+            error_message=str(e)
+        )
         raise
 
 def reset_state():
@@ -54,6 +86,12 @@ def reset_state():
 async def main():
     reset_state()  # Reset at the start of main
     print("Starting main execution...")
+    
+    # Initialize logger
+    logger = get_logger()
+    logger.log_file = "demo_llm_tool_calls.log"  # Use demo file directly
+    query = """Find the ASCII values of characters in INDIA and then return sum of exponentials of those values."""
+    
     try:
         # Create a single MCP server connection
         print("Establishing connection to MCP server...")
@@ -73,6 +111,15 @@ async def main():
                 tools_result = await session.list_tools()
                 tools = tools_result.tools
                 print(f"Successfully retrieved {len(tools)} tools")
+                
+                # Log the tool discovery
+                log_tool_call(
+                    tool_name="list_tools",
+                    arguments={},
+                    result={"tool_count": len(tools), "tool_names": [t.name for t in tools]},
+                    execution_time=0.0,
+                    success=True
+                )
                 
 
                 # Create system prompt with available tools
@@ -151,6 +198,7 @@ Your entire response should be a single line starting with either FUNCTION_CALL:
                 
                 while iteration < max_iterations:
                     print(f"\n--- Iteration {iteration + 1} ---")
+                    set_iteration(iteration)
                     if last_response is None:
                         current_query = query
                     else:
@@ -227,18 +275,25 @@ Your entire response should be a single line starting with either FUNCTION_CALL:
                             print(f"DEBUG: Final arguments: {arguments}")
                             print(f"DEBUG: Calling tool {func_name}")
                             
+                            # Log the tool call before execution
+                            start_time = time.time()
                             result = await session.call_tool(func_name, arguments=arguments)
+                            execution_time = time.time() - start_time
                             print(f"DEBUG: Raw result: {result}")
                             
-                            # Get the full result content
+                            # Get the full result content from MCP response
                             if hasattr(result, 'content'):
                                 print(f"DEBUG: Result has content attribute")
                                 # Handle multiple content items
                                 if isinstance(result.content, list):
-                                    iteration_result = [
-                                        item.text if hasattr(item, 'text') else str(item)
-                                        for item in result.content
-                                    ]
+                                    iteration_result = []
+                                    for item in result.content:
+                                        if hasattr(item, 'text'):
+                                            iteration_result.append(item.text)
+                                        elif hasattr(item, 'data'):
+                                            iteration_result.append(item.data)
+                                        else:
+                                            iteration_result.append(str(item))
                                 else:
                                     iteration_result = str(result.content)
                             else:
@@ -246,6 +301,15 @@ Your entire response should be a single line starting with either FUNCTION_CALL:
                                 iteration_result = str(result)
                                 
                             print(f"DEBUG: Final iteration result: {iteration_result}")
+                            
+                            # Log the successful tool call
+                            log_tool_call(
+                                tool_name=func_name,
+                                arguments=arguments,
+                                result=iteration_result,
+                                execution_time=execution_time,
+                                success=True
+                            )
                             
                             # Format the response based on result type
                             if isinstance(iteration_result, list):
@@ -260,22 +324,62 @@ Your entire response should be a single line starting with either FUNCTION_CALL:
                             last_response = iteration_result
 
                         except Exception as e:
+                            execution_time = time.time() - start_time if 'start_time' in locals() else 0.0
                             print(f"DEBUG: Error details: {str(e)}")
                             print(f"DEBUG: Error type: {type(e)}")
                             import traceback
                             traceback.print_exc()
+                            
+                            # Log the failed tool call
+                            log_tool_call(
+                                tool_name=func_name if 'func_name' in locals() else "unknown",
+                                arguments=arguments if 'arguments' in locals() else {},
+                                result=None,
+                                execution_time=execution_time,
+                                success=False,
+                                error_message=str(e)
+                            )
+                            
                             iteration_response.append(f"Error in iteration {iteration + 1}: {str(e)}")
                             break
 
                     elif response_text.startswith("FINAL_ANSWER:"):
                         print("\n=== Agent Execution Complete ===")
+                        
+                        # Log the final answer
+                        log_tool_call(
+                            tool_name="final_answer",
+                            arguments={"answer": response_text},
+                            result=response_text,
+                            execution_time=0.0,
+                            success=True
+                        )
+                        
+                        # Log paint operations
+                        start_time = time.time()
                         result = await session.call_tool("open_paint")
+                        execution_time = time.time() - start_time
                         print(result.content[0].text)
+                        
+                        # Extract actual result content
+                        if hasattr(result, 'content') and isinstance(result.content, list) and len(result.content) > 0:
+                            actual_result = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+                        else:
+                            actual_result = str(result)
+                            
+                        log_tool_call(
+                            tool_name="open_paint",
+                            arguments={},
+                            result=actual_result,
+                            execution_time=execution_time,
+                            success=True
+                        )
 
                         # Wait longer for Paint to be fully maximized
                         await asyncio.sleep(1)
 
                         # Draw a rectangle (900x300 pt canvas)
+                        start_time = time.time()
                         result = await session.call_tool(
                             "draw_rectangle",
                             arguments={
@@ -285,29 +389,92 @@ Your entire response should be a single line starting with either FUNCTION_CALL:
                                 "y2": 250
                             }
                         )
+                        execution_time = time.time() - start_time
                         print(result.content[0].text)
+                        
+                        # Extract actual result content
+                        if hasattr(result, 'content') and isinstance(result.content, list) and len(result.content) > 0:
+                            actual_result = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+                        else:
+                            actual_result = str(result)
+                            
+                        log_tool_call(
+                            tool_name="draw_rectangle",
+                            arguments={"x1": 50, "y1": 50, "x2": 850, "y2": 250},
+                            result=actual_result,
+                            execution_time=execution_time,
+                            success=True
+                        )
 
                         # Draw rectangle and add text
+                        start_time = time.time()
                         result = await session.call_tool(
                             "add_text_in_paint",
                             arguments={
                                 "text": response_text
                             }
                         )
+                        execution_time = time.time() - start_time
                         print(result.content[0].text)
+                        
+                        # Extract actual result content
+                        if hasattr(result, 'content') and isinstance(result.content, list) and len(result.content) > 0:
+                            actual_result = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+                        else:
+                            actual_result = str(result)
+                            
+                        log_tool_call(
+                            tool_name="add_text_in_paint",
+                            arguments={"text": response_text},
+                            result=actual_result,
+                            execution_time=execution_time,
+                            success=True
+                        )
                         
                         # Keep the window open
+                        start_time = time.time()
                         result = await session.call_tool("keep_window_open")
+                        execution_time = time.time() - start_time
                         print(result.content[0].text)
                         
+                        # Extract actual result content
+                        if hasattr(result, 'content') and isinstance(result.content, list) and len(result.content) > 0:
+                            actual_result = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+                        else:
+                            actual_result = str(result)
+                            
+                        log_tool_call(
+                            tool_name="keep_window_open",
+                            arguments={},
+                            result=actual_result,
+                            execution_time=execution_time,
+                            success=True
+                        )
+                        
                         # Send email with the final result
+                        start_time = time.time()
                         result = await session.call_tool(
                             "send_result_email",
                             arguments={
                                 "final_answer": response_text
                             }
                         )
+                        execution_time = time.time() - start_time
                         print(result.content[0].text)
+                        
+                        # Extract actual result content
+                        if hasattr(result, 'content') and isinstance(result.content, list) and len(result.content) > 0:
+                            actual_result = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+                        else:
+                            actual_result = str(result)
+                            
+                        log_tool_call(
+                            tool_name="send_result_email",
+                            arguments={"final_answer": response_text},
+                            result=actual_result,
+                            execution_time=execution_time,
+                            success=True
+                        )
                         break
 
                     iteration += 1
@@ -317,6 +484,26 @@ Your entire response should be a single line starting with either FUNCTION_CALL:
         import traceback
         traceback.print_exc()
     finally:
+        # End the session and create summary
+        session_summary = end_session(final_answer=last_response, query=query)
+        
+        # Print summary
+        print("\n" + "="*50)
+        print("LLM TOOL CALL SUMMARY")
+        print("="*50)
+        summary = get_summary()
+        print(f"Session ID: {summary['session_id']}")
+        print(f"Total Tool Calls: {summary['total_tool_calls']}")
+        print(f"Successful Calls: {summary['successful_calls']}")
+        print(f"Failed Calls: {summary['failed_calls']}")
+        print(f"Total Execution Time: {summary['total_execution_time']:.2f} seconds")
+        print(f"Average Execution Time: {summary['average_execution_time']:.2f} seconds")
+        print("\nTool Call Counts:")
+        for tool_name, count in summary['tool_call_counts'].items():
+            print(f"  {tool_name}: {count}")
+        
+        print(f"\nDetailed log saved to: demo_llm_tool_calls.log")
+        
         reset_state()  # Reset at the end of main
 
 if __name__ == "__main__":
