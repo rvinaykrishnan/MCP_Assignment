@@ -1,3 +1,4 @@
+# llm_logger.py
 """
 LLM Tool Call Logger
 This module provides comprehensive logging for all tool calls made during MCP execution.

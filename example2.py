@@ -1,3 +1,4 @@
+# example2.py
 # basic import 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.prompts import base
